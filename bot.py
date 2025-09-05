@@ -35,11 +35,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_dir = BASE_DIR / str(user_id)
     user_dir.mkdir(exist_ok=True)
     user_photos_count[user_id] = len(list(user_dir.glob("*.jpg")))
-    await update.message.reply_text(
-        f"🎉 Привет, {update.effective_user.first_name}!
-"
-        f"Отправь мне до {PHOTO_LIMIT} фото, и я их обработаю 📸"
-    )
+   await update.message.reply_text(
+    f"""🎉 Привет, {update.effective_user.first_name}!
+Отправь мне до {PHOTO_LIMIT} фото, и я их обработаю 📸"""
+)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
