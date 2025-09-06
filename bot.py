@@ -1,95 +1,98 @@
 import os
 import logging
-from io import BytesIO
-from PIL import Image, ImageEnhance
+from flask import Flask, request
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    ContextTypes, filters
-)
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
+from telegram.ext import CallbackContext
+from PIL import Image, ImageEnhance
+import io
 import zipfile
-from pathlib import Path
 
-logging.basicConfig(level=logging.INFO)
+# Логирование
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                    level=logging.INFO)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+# Получаем токен
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+if not TOKEN:
+    raise RuntimeError("Не найден TELEGRAM_TOKEN")
+
+# Создаем Flask-приложение
+app = Flask(__name__)
+
+# Создаем папку для фотографий
+os.makedirs("party_photos", exist_ok=True)
+
+# Количество фото на пользователя
 PHOTO_LIMIT = 15
-BASE_DIR = Path("party_photos")
-BASE_DIR.mkdir(exist_ok=True)
-ADMIN_ID = 123456789
+user_photos = {}
 
-user_photos_count = {}
-
-def apply_filter(image_bytes):
-    img = Image.open(BytesIO(image_bytes)).convert("RGB")
-    enhancer = ImageEnhance.Color(img)
-    img = enhancer.enhance(1.2)
-    enhancer = ImageEnhance.Contrast(img)
-    img = enhancer.enhance(1.1)
-    output = BytesIO()
-    img.save(output, format="JPEG", quality=90)
-    return output.getvalue()
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_dir = BASE_DIR / str(user_id)
-    user_dir.mkdir(exist_ok=True)
-    user_photos_count[user_id] = len(list(user_dir.glob("*.jpg")))
+async def start(update: Update, context: CallbackContext):
     await update.message.reply_text(
-        f"""🎉 Привет, {update.effective_user.first_name}!
-Отправь мне до {PHOTO_LIMIT} фото, и я их обработаю 📸"""
+        "🎉 Привет! Загружай сюда фото с вечеринки! Максимум 15 фотографий."
     )
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_dir = BASE_DIR / str(user_id)
-    user_dir.mkdir(exist_ok=True)
-    count = user_photos_count.get(user_id, len(list(user_dir.glob("*.jpg"))))
-    if count >= PHOTO_LIMIT:
-        await update.message.reply_text("🚫 Лимит фото исчерпан!")
+def apply_filter(image_bytes: bytes) -> bytes:
+    """Накладываем простой фильтр (увеличение яркости)"""
+    image = Image.open(io.BytesIO(image_bytes))
+    enhancer = ImageEnhance.Brightness(image)
+    filtered = enhancer.enhance(1.2)
+
+    output = io.BytesIO()
+    filtered.save(output, format="JPEG")
+    output.seek(0)
+    return output.read()
+
+async def handle_photo(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+
+    if user_photos.get(user_id, 0) >= PHOTO_LIMIT:
+        await update.message.reply_text("⚠️ Лимит 15 фотографий достигнут!")
         return
 
-    photo = update.message.photo[-1]
-    file = await context.bot.get_file(photo.file_id)
-    file_bytes = await file.download_as_bytearray()
-    filtered_bytes = apply_filter(file_bytes)
-    filename = user_dir / f"{count + 1}.jpg"
-    with open(filename, "wb") as f:
+    photo = await update.message.photo[-1].get_file()
+    image_bytes = await photo.download_as_bytearray()
+
+    filtered_bytes = apply_filter(image_bytes)
+
+    file_path = os.path.join("party_photos", f"{user_id}_{user_photos.get(user_id, 0)+1}.jpg")
+    with open(file_path, "wb") as f:
         f.write(filtered_bytes)
-    user_photos_count[user_id] = count + 1
 
-    await update.message.reply_text(
-        f"✅ Фото {count+1}/{PHOTO_LIMIT} сохранено и обработано!"
-    )
+    user_photos[user_id] = user_photos.get(user_id, 0) + 1
+    await update.message.reply_text(f"✅ Фото сохранено! ({user_photos[user_id]}/{PHOTO_LIMIT})")
 
-async def count_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    uploaded = user_photos_count.get(user_id, 0)
-    left = PHOTO_LIMIT - uploaded
-    await update.message.reply_text(f"📸 Загружено {uploaded}/{PHOTO_LIMIT}. Осталось {left}.")
+async def download_all(update: Update, context: CallbackContext):
+    """Создаем ZIP со всеми фото"""
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w") as zipf:
+        for filename in os.listdir("party_photos"):
+            path = os.path.join("party_photos", filename)
+            zipf.write(path, arcname=filename)
+    zip_buffer.seek(0)
 
-async def zip_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⛔ Доступ запрещен!")
-        return
-    zip_path = BASE_DIR / "all_photos.zip"
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        for root, _, files in os.walk(BASE_DIR):
-            for file in files:
-                if file.endswith(".jpg"):
-                    filepath = Path(root) / file
-                    zipf.write(filepath, arcname=filepath.relative_to(BASE_DIR))
-    await update.message.reply_document(open(zip_path, "rb"))
+    await update.message.reply_document(document=zip_buffer, filename="party_photos.zip")
 
-def main():
-    if not TELEGRAM_TOKEN:
-        raise RuntimeError("Не найден TELEGRAM_TOKEN")
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("count", count_cmd))
-    app.add_handler(CommandHandler("zip", zip_all))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.run_polling()
+# Создаем Telegram-приложение
+application = Application.builder().token(TOKEN).build()
+application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("download", download_all))
+application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+
+# Flask route для приема обновлений
+@app.route(f"/{TOKEN}", methods=["POST"])
+def webhook():
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    application.update_queue.put_nowait(update)
+    return "OK"
+
+# Устанавливаем webhook
+@app.route("/set_webhook", methods=["GET"])
+def set_webhook():
+    url = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/{TOKEN}"
+    success = application.bot.set_webhook(url)
+    return f"Webhook set: {success}"
 
 if __name__ == "__main__":
-    main()
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
